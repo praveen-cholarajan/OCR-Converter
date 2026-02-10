@@ -396,43 +396,293 @@ def fix_common_ocr_errors(text: str) -> str:
     
     return text
 
+def detect_table_in_text(text: str) -> bool:
+    """Detect if text contains a potential table structure."""
+    if not text or len(text.strip()) < 20:
+        return False
+    
+    lines = text.strip().split('\n')
+    if len(lines) < 3:
+        return False
+    
+    # Look for pipe characters (markdown tables) or repeated spacing patterns
+    pipe_lines = [l for l in lines if '|' in l]
+    if len(pipe_lines) >= 3:
+        return True
+    
+    # Check for aligned columns (4+ lines with consistent spacing)
+    spacing_patterns = []
+    for line in lines[:10]:  # Check first 10 lines
+        spaces = [m.start() for m in re.finditer(r'\s{2,}', line)]
+        if len(spaces) >= 2:
+            spacing_patterns.append(tuple(spaces[:3]))
+    
+    # If we see consistent column positions, likely a table
+    if len(spacing_patterns) >= 3:
+        common_patterns = {}
+        for pattern in spacing_patterns:
+            common_patterns[pattern] = common_patterns.get(pattern, 0) + 1
+        if any(count >= 2 for count in common_patterns.values()):
+            return True
+    
+    return False
+
+def extract_table_from_text(text: str) -> Tuple[bool, Optional[list]]:
+    """Extract table data from text. Returns (is_table, table_data)."""
+    lines = text.strip().split('\n')
+    if len(lines) < 3:
+        return False, None
+    
+    # Try parsing markdown table format
+    if all('|' in line for line in lines[:min(3, len(lines))]):
+        table_data = []
+        for line in lines:
+            if '|' in line:
+                cells = [cell.strip() for cell in line.split('|')]
+                cells = [c for c in cells if c]  # Remove empty cells
+                if cells:
+                    table_data.append(cells)
+        if len(table_data) >= 2:
+            return True, table_data
+    
+    # Try parsing column-aligned table (find column positions by spacing)
+    column_positions = set()
+    for line in lines:
+        words = re.finditer(r'\S+', line)
+        for match in words:
+            column_positions.add(match.start())
+    
+    if len(column_positions) >= 2:
+        column_positions = sorted(list(column_positions))
+        table_data = []
+        
+        for line in lines:
+            cells = []
+            for i, pos in enumerate(column_positions):
+                next_pos = column_positions[i + 1] if i + 1 < len(column_positions) else len(line)
+                cell = line[pos:next_pos].strip()
+                if cell:
+                    cells.append(cell)
+            if cells and len(cells) >= 2:
+                table_data.append(cells)
+        
+        if len(table_data) >= 2 and all(len(row) >= 2 for row in table_data):
+            return True, table_data
+    
+    return False, None
+
+def format_table_as_markdown(table_data: list) -> str:
+    """Format table data as markdown table."""
+    if not table_data or len(table_data) < 2:
+        return ""
+    
+    # Calculate column widths
+    col_count = max(len(row) for row in table_data)
+    col_widths = [0] * col_count
+    
+    for row in table_data:
+        for i, cell in enumerate(row):
+            if i < col_count:
+                col_widths[i] = max(col_widths[i], len(str(cell)))
+    
+    # Format header
+    header = table_data[0]
+    header_row = ' | '.join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(header))
+    separator = '-|-'.join('-' * w for w in col_widths)
+    
+    result = header_row + '\n' + separator + '\n'
+    
+    # Format data rows
+    for row in table_data[1:]:
+        # Pad row to match column count
+        padded_row = row + [''] * (col_count - len(row))
+        data_row = ' | '.join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(padded_row))
+        result += data_row + '\n'
+    
+    return result
+
+def format_table_as_html(table_data: list) -> str:
+    """Format table data as HTML table."""
+    if not table_data:
+        return ""
+    
+    html = '<table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse;">\n'
+    
+    # Header row
+    if table_data:
+        html += '  <thead>\n    <tr>\n'
+        for cell in table_data[0]:
+            escaped = str(cell).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            html += f'      <th>{escaped}</th>\n'
+        html += '    </tr>\n  </thead>\n'
+    
+    # Data rows
+    if len(table_data) > 1:
+        html += '  <tbody>\n'
+        for row in table_data[1:]:
+            html += '    <tr>\n'
+            for cell in row:
+                escaped = str(cell).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                html += f'      <td>{escaped}</td>\n'
+            html += '    </tr>\n'
+        html += '  </tbody>\n'
+    
+    html += '</table>\n'
+    return html
+
+def format_table_in_docx(document, table_data: list) -> None:
+    """Add formatted table to DOCX document."""
+    if not table_data or len(table_data) < 2:
+        return
+    
+    col_count = max(len(row) for row in table_data)
+    table = document.add_table(rows=len(table_data), cols=col_count)
+    table.style = 'Table Grid'
+    
+    # Fill in header row
+    hdr_cells = table.rows[0].cells
+    for i, cell_text in enumerate(table_data[0]):
+        if i < len(hdr_cells):
+            hdr_cells[i].text = str(cell_text)
+            # Make header bold
+            for paragraph in hdr_cells[i].paragraphs:
+                for run in paragraph.runs:
+                    run.bold = True
+    
+    # Fill in data rows
+    for row_idx, row_data in enumerate(table_data[1:], 1):
+        if row_idx < len(table.rows):
+            cells = table.rows[row_idx].cells
+            for col_idx, cell_text in enumerate(row_data):
+                if col_idx < len(cells):
+                    cells[col_idx].text = str(cell_text)
+
+def process_text_with_table_detection(text: str) -> list:
+    """Process text and split into segments with table detection."""
+    segments = []  # List of dicts: {type: 'text'|'table', content: str or list}
+    
+    lines = text.split('\n')
+    current_segment = []
+    in_table = False
+    
+    for line in lines:
+        # Check if line might be part of a table
+        is_table_line = bool(re.match(r'^\s*\|.*\|\s*$', line)) or (
+            len([m.start() for m in re.finditer(r'\s{2,}', line)]) >= 2
+        )
+        
+        if is_table_line and not in_table:
+            # Flush current text segment
+            if current_segment:
+                text_content = '\n'.join(current_segment).strip()
+                if text_content:
+                    segments.append({'type': 'text', 'content': text_content})
+                current_segment = []
+            in_table = True
+            current_segment.append(line)
+        elif not is_table_line and in_table and line.strip():
+            # Line doesn't look like table, check if we should stay in table
+            if not re.match(r'^\s*$', line):
+                current_segment.append(line)
+            else:
+                # Empty line might end table
+                table_text = '\n'.join(current_segment).strip()
+                is_table, table_data = extract_table_from_text(table_text)
+                if is_table and table_data:
+                    segments.append({'type': 'table', 'content': table_data})
+                else:
+                    segments.append({'type': 'text', 'content': table_text})
+                current_segment = []
+                in_table = False
+        else:
+            current_segment.append(line)
+    
+    # Flush remaining segment
+    if current_segment:
+        content = '\n'.join(current_segment).strip()
+        if content:
+            if in_table:
+                is_table, table_data = extract_table_from_text(content)
+                if is_table and table_data:
+                    segments.append({'type': 'table', 'content': table_data})
+                else:
+                    segments.append({'type': 'text', 'content': content})
+            else:
+                segments.append({'type': 'text', 'content': content})
+    
+    return segments
+
 def save_as_markdown(text_results: Dict[int, str], output_path: str) -> None:
-    """Save the extracted text results as a Markdown file."""
+    """Save the extracted text results as a Markdown file with table preservation."""
     with open(output_path, 'w', encoding='utf-8') as f:
-        for i in sorted(text_results.keys()):
-            text = text_results[i]
-            # Basic Markdown: treat paragraphs separated by double newlines
-            paragraphs = text.split('\n\n')
-            for para in paragraphs:
-                f.write(para.strip() + '\n\n') # Add double newline after each paragraph
-            # Add a horizontal rule as a page separator (optional)
-            if i < max(text_results.keys()):
+        for page_idx in sorted(text_results.keys()):
+            text = text_results[page_idx]
+            
+            # Process text to detect tables
+            segments = process_text_with_table_detection(text)
+            
+            for segment in segments:
+                if segment['type'] == 'table':
+                    # Format and write table
+                    table_md = format_table_as_markdown(segment['content'])
+                    f.write(table_md)
+                    f.write('\n\n')
+                else:
+                    # Write regular text paragraphs
+                    paragraphs = segment['content'].split('\n\n')
+                    for para in paragraphs:
+                        if para.strip():
+                            f.write(para.strip() + '\n\n')
+            
+            # Add page separator
+            if page_idx < max(text_results.keys()):
                 f.write('---\n\n')
 
+
 def save_as_html(text_results: Dict[int, str], output_path: str, title: str = "Converted Document") -> None:
-    """Save the extracted text results as a basic HTML file."""
+    """Save the extracted text results as an HTML file with table preservation."""
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write('<!DOCTYPE html>\n')
         f.write('<html lang="en">\n')
         f.write('<head>\n')
         f.write('    <meta charset="UTF-8">\n')
         f.write(f'    <title>{title}</title>\n')
-        f.write('    <style>body { font-family: sans-serif; line-height: 1.6; } .page-break { page-break-after: always; }</style>\n')
+        f.write('    <style>\n')
+        f.write('        body { font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }\n')
+        f.write('        .page-break { page-break-after: always; margin: 20px 0; border-top: 2px solid #999; padding-top: 20px; }\n')
+        f.write('        table { border-collapse: collapse; margin: 15px 0; width: 100%; }\n')
+        f.write('        table, th, td { border: 1px solid #333; }\n')
+        f.write('        th { background-color: #f2f2f2; padding: 12px; text-align: left; font-weight: bold; }\n')
+        f.write('        td { padding: 10px; }\n')
+        f.write('        p { margin: 10px 0; }\n')
+        f.write('    </style>\n')
         f.write('</head>\n')
         f.write('<body>\n')
         f.write(f'<h1>{title}</h1>\n')
         
-        for i in sorted(text_results.keys()):
-            text = text_results[i]
-            # Basic HTML: treat paragraphs separated by double newlines
-            paragraphs = text.split('\n\n')
-            for para in paragraphs:
-                # Escape basic HTML characters
-                escaped_para = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                f.write(f'<p>{escaped_para.strip()}</p>\n')
-            # Add a visual separator or page break indicator
-            if i < max(text_results.keys()):
-                f.write('<hr class="page-break">\n')
+        for page_idx in sorted(text_results.keys()):
+            text = text_results[page_idx]
+            
+            # Process text to detect tables
+            segments = process_text_with_table_detection(text)
+            
+            for segment in segments:
+                if segment['type'] == 'table':
+                    # Format and write table
+                    table_html = format_table_as_html(segment['content'])
+                    f.write(table_html)
+                    f.write('\n')
+                else:
+                    # Write regular text paragraphs
+                    paragraphs = segment['content'].split('\n\n')
+                    for para in paragraphs:
+                        if para.strip():
+                            escaped_para = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            f.write(f'<p>{escaped_para.strip()}</p>\n')
+            
+            # Add page separator
+            if page_idx < max(text_results.keys()):
+                f.write('<div class="page-break"></div>\n')
                 
         f.write('</body>\n')
         f.write('</html>\n')
@@ -569,17 +819,59 @@ def process_pdf_with_progress(pdf_path: str, conversion_id: str, ocr_engine: str
             for i in range(len(image_paths)):
                 if i in results:
                     text = results[i]
-                    document.add_paragraph(text)
+                    
+                    # Process text to detect tables
+                    segments = process_text_with_table_detection(text)
+                    
+                    for segment in segments:
+                        if segment['type'] == 'table':
+                            # Add table to document
+                            format_table_in_docx(document, segment['content'])
+                        else:
+                            # Add text paragraph
+                            if segment['content'].strip():
+                                document.add_paragraph(segment['content'].strip())
+                    
                     if i < len(image_paths) - 1:
                         document.add_page_break()
             document.save(output_path)
         elif output_format == "txt":
             with open(output_path, 'w', encoding='utf-8') as f:
                 for i in sorted(results.keys()):
-                    f.write(results[i])
+                    text = results[i]
+                    
+                    # Process text to detect tables
+                    segments = process_text_with_table_detection(text)
+                    
+                    for segment in segments:
+                        if segment['type'] == 'table':
+                            # Format table as simple text with alignment
+                            table_data = segment['content']
+                            if table_data:
+                                # Calculate column widths
+                                col_widths = [0] * max(len(row) for row in table_data)
+                                for row in table_data:
+                                    for j, cell in enumerate(row):
+                                        col_widths[j] = max(col_widths[j], len(str(cell)))
+                                
+                                # Write header
+                                header = table_data[0]
+                                f.write(' | '.join(str(c).ljust(col_widths[j]) for j, c in enumerate(header)) + '\n')
+                                f.write('-+-'.join('-' * w for w in col_widths) + '\n')
+                                
+                                # Write data rows
+                                for row in table_data[1:]:
+                                    padded = row + [''] * (len(col_widths) - len(row))
+                                    f.write(' | '.join(str(c).ljust(col_widths[j]) for j, c in enumerate(padded)) + '\n')
+                                f.write('\n')
+                        else:
+                            # Write regular text
+                            if segment['content'].strip():
+                                f.write(segment['content'].strip() + '\n')
+                    
                     # Add a separator between pages for clarity
                     if i < max(results.keys()):
-                        f.write("\n\n--- Page Break ---\n\n")
+                        f.write("\n--- Page Break ---\n\n")
         elif output_format == "md":
             save_as_markdown(results, output_path)
         elif output_format == "html":

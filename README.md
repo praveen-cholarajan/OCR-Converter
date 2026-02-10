@@ -309,3 +309,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [python-docx](https://python-docx.readthedocs.io/) for DOCX creation
 - [Tailwind CSS](https://tailwindcss.com/) for the UI components
 - [colorama](https://pypi.org/project/colorama/) for colored test output
+
+
+https://github.com/fabriziosalmi/pdf-ocr?utm_source=chatgpt.com
